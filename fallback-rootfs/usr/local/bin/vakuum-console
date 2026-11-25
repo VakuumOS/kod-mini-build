@@ -1,0 +1,121 @@
+#!/bin/sh
+# shellcheck shell=busybox
+# =====================================================================
+#  vakuum-console — UTF-8 Linux console with Cyrillic font and EN/RU
+#  keyboard layouts (BusyBox setfont / kbd_mode / loadkmap)
+# ---------------------------------------------------------------------
+#  Fonts:   /usr/share/consolefonts/*.psf[u]   (Terminus ter-u16n first)
+#  Keymaps: /usr/share/keymaps/*.bmap          (binary, from kbd maps)
+#           ru.bmap = US + Russian, Ctrl+Shift toggles the layout
+#           us.bmap = US English only
+#  Settings: /etc/kod/console.conf
+# =====================================================================
+
+KOD_CONSOLE_FONTS="ter-u16n.psf ter-v16n.psf cyr-sun16.psfu UniCyr_8x16.psf"
+KOD_CONSOLE_KEYMAP=ru
+KOD_CONSOLE_VTS="1 2 3 4 5 6"
+FONT_DIR=/usr/share/consolefonts
+KEYMAP_DIR=/usr/share/keymaps
+[ -r /etc/kod/console.conf ] && . /etc/kod/console.conf
+
+PROG="${0##*/}"
+say() { echo "${PROG}: $*"; }
+
+usage() {
+    cat <<EOF
+Usage: ${PROG} COMMAND
+
+Commands:
+  init         UTF-8 mode + font + default keymap (${KOD_CONSOLE_KEYMAP}) on all VTs
+  ru           Russian + English layout (toggle with Ctrl+Shift)
+  us           English (US) layout only
+  font [FILE]  load a console font (default: first of ${KOD_CONSOLE_FONTS})
+  status       show what is installed
+EOF
+}
+
+each_vt() {
+    local n
+    for n in ${KOD_CONSOLE_VTS}; do
+        [ -c "/dev/tty${n}" ] && echo "/dev/tty${n}"
+    done
+}
+
+utf8_on() {
+    local vt
+    for vt in $(each_vt); do
+        # Terminal output: UTF-8 (ESC % G), keyboard input: Unicode mode.
+        printf '\033%%G' >"${vt}"
+        kbd_mode -u -C "${vt}" 2>/dev/null
+    done
+}
+
+find_font() {
+    local f
+    if [ -n "${1:-}" ]; then
+        case "$1" in
+            /*) f="$1" ;;
+            *) f="${FONT_DIR}/$1" ;;
+        esac
+        [ -r "${f}" ] && echo "${f}"
+        return
+    fi
+    for f in ${KOD_CONSOLE_FONTS}; do
+        [ -r "${FONT_DIR}/${f}" ] && { echo "${FONT_DIR}/${f}"; return; }
+    done
+}
+
+load_font() {
+    local font vt
+    font="$(find_font "${1:-}")"
+    if [ -z "${font}" ]; then
+        say "no Cyrillic console font found in ${FONT_DIR}"
+        return 1
+    fi
+    for vt in $(each_vt); do
+        setfont -C "${vt}" "${font}" 2>/dev/null ||
+            { say "setfont failed on ${vt} (no framebuffer/VGA console?)"; return 1; }
+    done
+    say "font ${font##*/}"
+}
+
+load_keymap() {
+    local map="${KEYMAP_DIR}/$1.bmap"
+    if [ ! -r "${map}" ]; then
+        say "keymap $1 not installed (${map})"
+        return 1
+    fi
+    loadkmap <"${map}" || return 1
+    case "$1" in
+        ru) say "keymap: EN/RU — Ctrl+Shift switches the layout" ;;
+        *) say "keymap: $1" ;;
+    esac
+}
+
+case "${1:-}" in
+    init)
+        utf8_on
+        load_font
+        load_keymap "${KOD_CONSOLE_KEYMAP}"
+        exit 0
+        ;;
+    ru|us)
+        utf8_on
+        load_keymap "$1"
+        ;;
+    font)
+        load_font "${2:-}"
+        ;;
+    status)
+        echo "fonts:   $(cd "${FONT_DIR}" 2>/dev/null && echo *)"
+        echo "keymaps: $(cd "${KEYMAP_DIR}" 2>/dev/null && echo *)"
+        echo "LANG=${LANG:-unset}"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

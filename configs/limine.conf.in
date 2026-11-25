@@ -1,0 +1,56 @@
+# =====================================================================
+#  Vakuum OS Builder (kod-mini) — Limine boot menu
+#  Generated from configs/limine.conf.in by scripts/build.sh.
+#  Build: @BUILD_ID@
+# =====================================================================
+
+timeout: 5
+verbose: no
+interface_branding: Vakuum OS Builder @KOD_VERSION@ (@ARCH@)
+interface_branding_colour: 6
+serial: yes
+serial_baudrate: 115200
+
+# Default: the root filesystem is loaded into RAM by Limine itself
+# (works from CD/DVD, USB and network-booted images alike).
+/Vakuum OS Builder @KOD_VERSION@
+    comment: musl + LLVM live system, root filesystem in RAM
+    protocol: linux
+    path: boot():/boot/kod/vmlinuz
+    cmdline: @CMDLINE@
+    module_path: boot():/boot/kod/rootfs.img
+    module_path: boot():/boot/kod/initramfs.img
+
+# Low memory: SquashFS stays on the boot medium (loop-mounted).
+/Vakuum OS Builder (low memory, read from medium)
+    comment: for machines with very little RAM; keep the medium attached
+    protocol: linux
+    path: boot():/boot/kod/vmlinuz
+    cmdline: @CMDLINE@ kod.media
+    module_path: boot():/boot/kod/initramfs.img
+
+# Safe graphics: firmware framebuffer only (no DRM drivers).
+/Vakuum OS Builder (safe graphics)
+    comment: nomodeset — use if the screen stays black
+    protocol: linux
+    path: boot():/boot/kod/vmlinuz
+    cmdline: @CMDLINE@ nomodeset
+    module_path: boot():/boot/kod/rootfs.img
+    module_path: boot():/boot/kod/initramfs.img
+
+# Serial console first (/dev/console = @SERIAL_TTY@).
+/Vakuum OS Builder (serial console @SERIAL_TTY@)
+    comment: kernel and boot messages on @SERIAL_TTY@, 115200 8N1
+    protocol: linux
+    path: boot():/boot/kod/vmlinuz
+    cmdline: @CMDLINE_SERIAL@
+    module_path: boot():/boot/kod/rootfs.img
+    module_path: boot():/boot/kod/initramfs.img
+
+/Rescue shell (stage 1 initramfs)
+    comment: BusyBox shell before the root filesystem is mounted
+    protocol: linux
+    path: boot():/boot/kod/vmlinuz
+    cmdline: @CMDLINE@ kod.break=premount
+    module_path: boot():/boot/kod/rootfs.img
+    module_path: boot():/boot/kod/initramfs.img

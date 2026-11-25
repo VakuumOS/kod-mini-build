@@ -1,0 +1,203 @@
+#!/bin/busybox sh
+# shellcheck shell=busybox
+# =====================================================================
+#  Vakuum OS Builder (kod-mini) — stage 1 init (initramfs)
+# ---------------------------------------------------------------------
+#  Locates the compressed root filesystem (SquashFS/zstd), stacks a
+#  RAM-backed OverlayFS on top of it and switch_root's into the real
+#  /init (from kod-mini-rootfs or fallback-rootfs).
+#
+#  The SquashFS image ships inside /boot/kod/rootfs.img — a newc cpio
+#  archive with a single member "rootfs.sfs". Two boot modes exist:
+#
+#   RAM mode (default): Limine loads rootfs.img as a second initrd
+#     module, the kernel unpacks it, /rootfs.sfs is already in RAM.
+#   Media mode (kod.media): rootfs.img is read from the boot medium and
+#     loop-mounted at the cpio data offset (low memory machines).
+#
+#  Kernel command line options:
+#   kod.id=ID         build id; media mode only accepts a matching disk
+#   kod.media         read the root filesystem from the boot medium
+#   kod.toram         (media mode) copy rootfs.img to RAM, free the disk
+#   kod.timeout=SEC   how long to wait for the boot medium (default 30)
+#   kod.ramsize=SIZE  size limit of the RAM overlay (default 75%)
+#   kod.break[=premount|mount]  drop to a rescue shell
+#   kod.debug         trace this script
+# =====================================================================
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+/bin/busybox mkdir -p /bin /sbin /proc /sys /dev /run /tmp /newroot
+/bin/busybox --install -s /bin
+
+mount -t proc -o nosuid,noexec,nodev proc /proc
+mount -t sysfs -o nosuid,noexec,nodev sysfs /sys
+mount -t devtmpfs -o mode=0755,nosuid devtmpfs /dev 2>/dev/null ||
+    mount -t tmpfs -o mode=0755,nosuid tmpfs /dev
+mount -t tmpfs -o mode=0755,nosuid,nodev run /run
+
+[ -c /dev/console ] && exec </dev/console >/dev/console 2>&1
+
+KOD_RUN=/run/kod
+KOD_ID=""
+KOD_MEDIA=0
+KOD_TORAM=0
+KOD_TIMEOUT=30
+KOD_RAMSIZE="75%"
+KOD_BREAK=""
+
+msg() { echo "[kod-stage1] $*"; }
+
+rescue_shell() {
+    msg "$*"
+    msg "Rescue shell — type 'exit' to continue booting."
+    setsid cttyhack sh -l
+}
+
+for arg in $(cat /proc/cmdline); do
+    case "${arg}" in
+        kod.id=*) KOD_ID="${arg#kod.id=}" ;;
+        kod.media|kod.media=1) KOD_MEDIA=1 ;;
+        kod.toram|kod.toram=1) KOD_TORAM=1 ;;
+        kod.timeout=*) KOD_TIMEOUT="${arg#kod.timeout=}" ;;
+        kod.ramsize=*) KOD_RAMSIZE="${arg#kod.ramsize=}" ;;
+        kod.break) KOD_BREAK=premount ;;
+        kod.break=*) KOD_BREAK="${arg#kod.break=}" ;;
+        kod.debug) set -x ;;
+    esac
+done
+
+case "${KOD_TIMEOUT}" in
+    ''|*[!0-9]*) KOD_TIMEOUT=30 ;;
+esac
+
+mkdir -p "${KOD_RUN}/media" "${KOD_RUN}/ro" "${KOD_RUN}/rw"
+
+# ---------------------------------------------------------------------
+#  Root filesystem discovery
+# ---------------------------------------------------------------------
+
+# media_matches DIR — the mounted medium carries our root filesystem.
+media_matches() {
+    [ -f "$1/boot/kod/rootfs.img" ] || return 1
+    [ -z "${KOD_ID}" ] && return 0
+    [ "$(cat "$1/boot/kod/build-id" 2>/dev/null)" = "${KOD_ID}" ]
+}
+
+# find_media — mount the boot medium on ${KOD_RUN}/media.
+find_media() {
+    local waited=0 dev name
+    msg "Searching for the boot medium (build ${KOD_ID:-any})..."
+    while [ "${waited}" -le "${KOD_TIMEOUT}" ]; do
+        for dev in /sys/class/block/*; do
+            name="${dev##*/}"
+            case "${name}" in
+                loop*|ram*|zram*|dm-*) continue ;;
+            esac
+            [ -b "/dev/${name}" ] || continue
+            # Only ISO 9660 is probed: never touch the user's target disks.
+            if mount -t iso9660 -o ro "/dev/${name}" "${KOD_RUN}/media" 2>/dev/null; then
+                if media_matches "${KOD_RUN}/media"; then
+                    msg "Boot medium: /dev/${name}"
+                    return 0
+                fi
+                umount "${KOD_RUN}/media"
+            fi
+        done
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+# cpio_data_offset FILE — byte offset of the first member's data inside
+# a newc cpio archive (the member must be "rootfs.sfs").
+cpio_data_offset() {
+    local magic namesize name
+    magic="$(dd if="$1" bs=1 count=6 2>/dev/null)"
+    [ "${magic}" = "070701" ] || return 1
+    namesize="$(dd if="$1" bs=1 skip=94 count=8 2>/dev/null)"
+    namesize=$((0x${namesize}))
+    name="$(dd if="$1" bs=1 skip=110 count=$((namesize - 1)) 2>/dev/null)"
+    [ "${name}" = "rootfs.sfs" ] || return 1
+    echo $(((110 + namesize + 3) / 4 * 4))
+}
+
+# attach_loop FILE OFFSET — print the read-only loop device for FILE.
+attach_loop() {
+    local dev
+    dev="$(losetup -f)" || return 1
+    losetup -r -o "$2" "${dev}" "$1" || return 1
+    echo "${dev}"
+}
+
+mount_rootfs_image() {
+    local img="" offset=0 loopdev
+
+    if [ "${KOD_MEDIA}" = 0 ] && [ -f /rootfs.sfs ]; then
+        msg "Root filesystem: in RAM (Limine module)"
+        img=/rootfs.sfs
+    else
+        [ "${KOD_MEDIA}" = 1 ] || msg "rootfs.sfs not in initramfs — trying the boot medium"
+        find_media || return 1
+        img="${KOD_RUN}/media/boot/kod/rootfs.img"
+        if [ "${KOD_TORAM}" = 1 ]; then
+            msg "Copying the root filesystem to RAM (kod.toram)..."
+            cp "${img}" "${KOD_RUN}/rootfs.img" || return 1
+            umount "${KOD_RUN}/media"
+            img="${KOD_RUN}/rootfs.img"
+        fi
+        offset="$(cpio_data_offset "${img}")" || {
+            msg "${img}: not a kod-mini root filesystem archive"
+            return 1
+        }
+    fi
+
+    loopdev="$(attach_loop "${img}" "${offset}")" || return 1
+    mount -t squashfs -o ro "${loopdev}" "${KOD_RUN}/ro" || {
+        losetup -d "${loopdev}"
+        return 1
+    }
+}
+
+mount_overlay() {
+    mount -t tmpfs -o "mode=0755,size=${KOD_RAMSIZE}" kod-rw "${KOD_RUN}/rw" ||
+        return 1
+    mkdir -p "${KOD_RUN}/rw/upper" "${KOD_RUN}/rw/work"
+    mount -t overlay \
+        -o "lowerdir=${KOD_RUN}/ro,upperdir=${KOD_RUN}/rw/upper,workdir=${KOD_RUN}/rw/work" \
+        kod-root /newroot
+}
+
+# ---------------------------------------------------------------------
+#  Main
+# ---------------------------------------------------------------------
+msg "Vakuum OS Builder — stage 1 ($(uname -r))"
+
+[ "${KOD_BREAK}" = "premount" ] && rescue_shell "kod.break=premount"
+
+until mount_rootfs_image; do
+    rescue_shell "Cannot find/mount the root filesystem image."
+done
+
+until mount_overlay; do
+    rescue_shell "Cannot set up the RAM overlay on /newroot."
+done
+
+[ "${KOD_BREAK}" = "mount" ] && rescue_shell "kod.break=mount (/newroot ready)"
+
+INIT=/init
+[ -x "/newroot${INIT}" ] || INIT=/sbin/init
+until [ -x "/newroot${INIT}" ]; do
+    rescue_shell "No executable /init or /sbin/init in the root filesystem."
+    INIT=/init
+    [ -x "/newroot${INIT}" ] || INIT=/sbin/init
+done
+
+# Hand the API filesystems (and /run/kod with our mounts) to the new root.
+for m in /dev /proc /sys /run; do
+    mkdir -p "/newroot${m}"
+    mount --move "${m}" "/newroot${m}"
+done
+
+exec switch_root /newroot "${INIT}"

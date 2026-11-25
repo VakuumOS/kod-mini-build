@@ -1,0 +1,24 @@
+# shellcheck shell=sh disable=SC1090
+# /etc/profile — Vakuum OS Builder (kod-mini), read by login shells
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Stage 2: prebuilt LLVM/Clang + Rust toolchain from kod-mini-toolchain.
+if [ -d /opt/kod-toolchain/bin ]; then
+    export PATH="/opt/kod-toolchain/bin:${PATH}"
+fi
+
+# musl: any locale name other than C/POSIX enables UTF-8 (Cyrillic).
+export LANG=C.UTF-8
+export EDITOR=vi
+export PAGER=less
+export INPUTRC=/etc/inputrc
+umask 022
+
+for _f in /etc/profile.d/*.sh; do
+    [ -r "${_f}" ] && . "${_f}"
+done
+unset _f
+
+if [ -n "${BASH_VERSION:-}" ] && [ -r /etc/bash.bashrc ]; then
+    . /etc/bash.bashrc
+fi

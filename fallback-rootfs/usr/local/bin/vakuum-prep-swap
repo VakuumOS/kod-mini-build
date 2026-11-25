@@ -1,0 +1,298 @@
+#!/bin/sh
+# shellcheck shell=busybox
+# =====================================================================
+#  vakuum-prep-swap — temporary swap for compiling Vakuum OS
+# ---------------------------------------------------------------------
+#  LLVM/Clang and Rust need a lot of memory; on machines with less than
+#  4 GiB of RAM the build would be killed by the OOM killer. This tool
+#  adds swap in two layers:
+#
+#   * zram  — compressed swap in RAM (zstd), high priority, no disk I/O
+#   * file  — a swap file on the TARGET disk (ext4/btrfs/xfs/f2fs)
+#
+#  Everything it creates is recorded in /run/kod/swap.list and removed
+#  again by "vakuum-prep-swap --off" (also called on poweroff/reboot).
+#
+#  Settings (optional): /etc/kod/swap.conf
+# =====================================================================
+
+set -u
+
+KOD_SWAP_THRESHOLD_MB=4096        # act only below this much RAM
+KOD_SWAP_TOTAL_MB=8192            # aim for RAM + swap >= this
+KOD_SWAP_MIN_MB=1024              # never create a smaller swap file
+KOD_SWAP_RESERVE_MB=2048          # keep this much free on the target
+KOD_SWAP_FILE_NAME=.vakuum-swapfile
+KOD_ZRAM_MAX_MB=4096              # zram: min(RAM/2, this)
+KOD_TARGET_LABEL=VAKUUM_ROOT      # --boot: auto-detected target filesystem
+KOD_TARGET_MNT=/mnt/vakuum
+KOD_SWAP_AUTO_TARGET=1            # --boot: use a labelled target if found
+[ -r /etc/kod/swap.conf ] && . /etc/kod/swap.conf
+
+STATE=/run/kod/swap.list
+PROG="${0##*/}"
+
+say() { echo "${PROG}: $*"; }
+err() { echo "${PROG}: error: $*" >&2; }
+
+usage() {
+    cat <<EOF
+Usage: ${PROG} [options] [TARGET]
+
+Create temporary swap when the machine has less than
+${KOD_SWAP_THRESHOLD_MB} MiB of RAM.
+
+TARGET is the mount point of the target filesystem (e.g. ${KOD_TARGET_MNT})
+or a block device holding it (e.g. /dev/sda2, mounted automatically).
+
+Options:
+  -s, --size MiB  swap file size (default: ${KOD_SWAP_TOTAL_MB} MiB minus RAM,
+                  at least ${KOD_SWAP_MIN_MB} MiB)
+  -f, --force     create swap even when RAM is sufficient
+      --zram      only set up compressed RAM swap (zram)
+      --boot      boot mode: zram + swap file on a filesystem labelled
+                  ${KOD_TARGET_LABEL} (if one exists)
+      --off       disable and delete all swap created by this tool
+      --status    show active swap
+  -h, --help      show this help
+EOF
+}
+
+mem_mb() { awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo; }
+
+record() { mkdir -p "${STATE%/*}" && echo "$*" >>"${STATE}"; }
+
+is_active() { awk -v d="$1" 'NR > 1 && $1 == d { f = 1 } END { exit !f }' /proc/swaps; }
+
+# --------------------------------------------------------------------
+#  zram
+# --------------------------------------------------------------------
+setup_zram() {
+    local size dev=/dev/zram0 sys=/sys/block/zram0
+    if [ ! -d "${sys}" ] && [ -w /sys/class/zram-control/hot_add ]; then
+        cat /sys/class/zram-control/hot_add >/dev/null
+    fi
+    if [ ! -d "${sys}" ] || [ ! -b "${dev}" ]; then
+        say "zram is not available in this kernel — skipping"
+        return 0
+    fi
+    if is_active "${dev}"; then
+        say "zram swap already active"
+        return 0
+    fi
+    size=$(($(mem_mb) / 2))
+    [ "${size}" -gt "${KOD_ZRAM_MAX_MB}" ] && size="${KOD_ZRAM_MAX_MB}"
+    [ "${size}" -lt 64 ] && size=64
+    echo 1 >"${sys}/reset" 2>/dev/null
+    echo zstd >"${sys}/comp_algorithm" 2>/dev/null ||
+        say "zstd not supported by zram, using the kernel default"
+    echo "$((size * 1024 * 1024))" >"${sys}/disksize" || return 1
+    mkswap "${dev}" >/dev/null || return 1
+    swapon -p 100 "${dev}" || return 1
+    record "zram ${dev}"
+    say "zram swap: ${size} MiB (compressed RAM, priority 100)"
+}
+
+# --------------------------------------------------------------------
+#  swap file on the target disk
+# --------------------------------------------------------------------
+# mount_target TARGET — print a directory for TARGET (mount if device).
+mount_target() {
+    local dev="$1" mp
+    if [ -d "${dev}" ]; then
+        echo "${dev}"
+        return 0
+    fi
+    if [ ! -b "${dev}" ]; then
+        err "${dev}: not a directory or block device"
+        return 1
+    fi
+    mp="$(awk -v d="${dev}" '$1 == d { print $2; exit }' /proc/mounts)"
+    if [ -n "${mp}" ]; then
+        echo "${mp}"
+        return 0
+    fi
+    mp="/run/kod/swap-target/${dev##*/}"
+    mkdir -p "${mp}"
+    mount "${dev}" "${mp}" || {
+        err "cannot mount ${dev}"
+        return 1
+    }
+    record "mount ${mp}"
+    echo "${mp}"
+}
+
+# fs_info DIR — print "<fstype> <mountpoint> <avail_kib>" for DIR.
+fs_info() {
+    local mp avail fstype
+    # shellcheck disable=SC2046  # split "avail mountpoint" on purpose
+    set -- $(df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4, $6 }')
+    avail="${1:-0}"
+    mp="${2:-/}"
+    fstype="$(awk -v m="${mp}" '$2 == m { t = $3 } END { print t }' /proc/mounts)"
+    echo "${fstype:-unknown} ${mp} ${avail}"
+}
+
+setup_swapfile() {
+    local dir="$1" want="$2" fstype mp avail file avail_mb
+    # shellcheck disable=SC2046  # split "fstype mountpoint avail"
+    set -- $(fs_info "${dir}")
+    fstype="$1" mp="$2" avail="$3"
+    case "${fstype}" in
+        ext2|ext3|ext4|btrfs|xfs|f2fs) ;;
+        *)
+            err "${dir} is on '${fstype}' — a swap file needs a real disk"
+            err "filesystem (ext4, btrfs, xfs, f2fs). Format and mount the target first."
+            return 1
+            ;;
+    esac
+
+    file="${mp%/}/${KOD_SWAP_FILE_NAME}"
+    if is_active "${file}"; then
+        say "swap file ${file} already active"
+        return 0
+    fi
+
+    avail_mb=$((avail / 1024 - KOD_SWAP_RESERVE_MB))
+    if [ "${avail_mb}" -lt "${KOD_SWAP_MIN_MB}" ]; then
+        err "not enough free space on ${mp} ($((avail / 1024)) MiB free)"
+        return 1
+    fi
+    if [ "${want}" -gt "${avail_mb}" ]; then
+        say "reducing swap file to ${avail_mb} MiB (free space on ${mp})"
+        want="${avail_mb}"
+    fi
+
+    say "creating ${want} MiB swap file ${file} (${fstype})..."
+    rm -f "${file}"
+    : >"${file}" || return 1
+    chmod 600 "${file}"
+    if [ "${fstype}" = btrfs ]; then
+        # btrfs swap files must be NOCOW (and therefore uncompressed).
+        chattr +C "${file}" 2>/dev/null || say "chattr +C failed (btrfs)"
+    fi
+    if ! fallocate -l "$((want * 1024 * 1024))" "${file}" 2>/dev/null; then
+        dd if=/dev/zero of="${file}" bs=1M count="${want}" 2>/dev/null || {
+            rm -f "${file}"
+            err "cannot allocate ${file}"
+            return 1
+        }
+    fi
+    if ! mkswap "${file}" >/dev/null || ! swapon -p 10 "${file}"; then
+        rm -f "${file}"
+        err "swapon failed for ${file}"
+        return 1
+    fi
+    record "file ${file}"
+    say "swap file active: ${file} (${want} MiB, priority 10)"
+}
+
+default_size() {
+    local s
+    s=$((KOD_SWAP_TOTAL_MB - $(mem_mb)))
+    [ "${s}" -lt "${KOD_SWAP_MIN_MB}" ] && s="${KOD_SWAP_MIN_MB}"
+    echo "${s}"
+}
+
+# --------------------------------------------------------------------
+#  teardown / status
+# --------------------------------------------------------------------
+swap_off() {
+    local kind what lines
+    [ -f "${STATE}" ] || return 0
+    # Undo in reverse order.
+    lines="$(sed '1!G;h;$!d' "${STATE}")"
+    echo "${lines}" | while read -r kind what; do
+        case "${kind}" in
+            zram)
+                swapoff "${what}" 2>/dev/null
+                echo 1 >/sys/block/"${what##*/}"/reset 2>/dev/null
+                ;;
+            file)
+                swapoff "${what}" 2>/dev/null
+                rm -f "${what}"
+                ;;
+            mount)
+                umount "${what}" 2>/dev/null
+                ;;
+        esac
+    done
+    rm -f "${STATE}"
+    say "temporary swap removed"
+}
+
+swap_status() {
+    echo "RAM: $(mem_mb) MiB (threshold ${KOD_SWAP_THRESHOLD_MB} MiB)"
+    cat /proc/swaps
+}
+
+# --------------------------------------------------------------------
+#  main
+# --------------------------------------------------------------------
+MODE="file"
+FORCE=0
+SIZE=""
+TARGET=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s|--size) SIZE="${2:-}"; shift ;;
+        --size=*) SIZE="${1#--size=}" ;;
+        -f|--force) FORCE=1 ;;
+        --zram) MODE=zram ;;
+        --boot) MODE=boot ;;
+        --off) MODE=off ;;
+        --status) MODE=status ;;
+        -h|--help) usage; exit 0 ;;
+        -*) err "unknown option: $1"; usage >&2; exit 2 ;;
+        *) TARGET="$1" ;;
+    esac
+    shift
+done
+
+case "${SIZE}" in
+    ''|*[!0-9]*) [ -z "${SIZE}" ] || { err "invalid size: ${SIZE}"; exit 2; } ;;
+esac
+
+case "${MODE}" in
+    off) swap_off; exit 0 ;;
+    status) swap_status; exit 0 ;;
+esac
+
+RAM="$(mem_mb)"
+if [ "${RAM}" -ge "${KOD_SWAP_THRESHOLD_MB}" ] && [ "${FORCE}" = 0 ]; then
+    [ "${MODE}" = boot ] ||
+        say "${RAM} MiB RAM >= ${KOD_SWAP_THRESHOLD_MB} MiB — no swap needed (use -f to force)"
+    exit 0
+fi
+
+case "${MODE}" in
+    zram)
+        setup_zram
+        ;;
+    boot)
+        say "${RAM} MiB RAM < ${KOD_SWAP_THRESHOLD_MB} MiB — preparing swap"
+        setup_zram
+        if [ "${KOD_SWAP_AUTO_TARGET}" = 1 ]; then
+            dev="$(findfs "LABEL=${KOD_TARGET_LABEL}" 2>/dev/null)"
+            if [ -n "${dev}" ]; then
+                mp="$(awk -v d="${dev}" '$1 == d { print $2; exit }' /proc/mounts)"
+                if [ -z "${mp}" ]; then
+                    mkdir -p "${KOD_TARGET_MNT}"
+                    mount "${dev}" "${KOD_TARGET_MNT}" && mp="${KOD_TARGET_MNT}"
+                fi
+                [ -n "${mp}" ] && setup_swapfile "${mp}" "${SIZE:-$(default_size)}"
+            fi
+        fi
+        exit 0
+        ;;
+    file)
+        if [ -z "${TARGET}" ]; then
+            err "no TARGET given (mount point or device of the target disk)"
+            usage >&2
+            exit 2
+        fi
+        dir="$(mount_target "${TARGET}")" || exit 1
+        setup_swapfile "${dir}" "${SIZE:-$(default_size)}" || exit 1
+        ;;
+esac

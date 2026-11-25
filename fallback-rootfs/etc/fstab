@@ -1,0 +1,3 @@
+# /etc/fstab — kod-mini runs entirely from RAM; the API filesystems are
+# mounted by /init. Add target disks here only for manual 'mount -a'.
+# <device>      <mountpoint>    <type>  <options>       <dump> <pass>

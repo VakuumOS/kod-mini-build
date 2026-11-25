@@ -1,0 +1,310 @@
+#!/bin/sh
+# shellcheck shell=busybox
+# =====================================================================
+#  Vakuum OS Builder (kod-mini) — /init (PID 1)
+# ---------------------------------------------------------------------
+#  Fallback init shipped inside kod-mini-build. It is used whenever the
+#  kod-mini-rootfs repository is empty or unreachable at build time.
+#
+#   1. mounts the API filesystems (/proc /sys /dev /dev/pts /run /tmp)
+#   2. switches the consoles to UTF-8 (+ Cyrillic font and keymap)
+#   3. brings up the first wired NIC via DHCP (BusyBox udhcpc)
+#   4. prepares swap (zram when RAM < 4 GiB)
+#   5. prints the welcome banner and runs bash on tty1 (+ ttyS0)
+#   6. stays PID 1: reaps zombies, handles poweroff/reboot/Ctrl+Alt+Del
+#
+#  Kernel command line options:
+#   kod.nonet          do not configure the network
+#   kod.iface=NAME     use this network interface instead of auto-detect
+#   kod.noswap         do not set up zram/disk swap at boot
+#   kod.shell=PATH     interactive shell (default /bin/bash)
+#   kod.debug          trace this script
+# =====================================================================
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export TERM=linux
+export LANG=C.UTF-8
+umask 022
+
+# ---------------------------------------------------------------------
+#  Respawn mode (not PID 1): "/init --respawn-shell TTY TERM"
+#  Keeps a login shell alive on /dev/TTY. setsid -c makes TTY the
+#  controlling terminal of a new session, cttyhack then simply execs
+#  the shell — job control (Ctrl+C/Ctrl+Z, fg/bg) works as expected.
+# ---------------------------------------------------------------------
+if [ "$1" = "--respawn-shell" ] && [ "$$" != 1 ]; then
+    tty="$2"
+    export TERM="${3:-linux}"
+    shell=/bin/bash
+    for arg in $(cat /proc/cmdline); do
+        case "${arg}" in kod.shell=*) shell="${arg#kod.shell=}" ;; esac
+    done
+    [ -x "${shell}" ] || shell=/bin/sh
+    while [ -c "/dev/${tty}" ]; do
+        cat /run/kod/banner >"/dev/${tty}" 2>/dev/null
+        setsid -c cttyhack "${shell}" -l <>"/dev/${tty}" >&0 2>&1
+        sleep 1
+    done
+    exit 0
+fi
+
+KOD_VERSION=0.1
+[ -r /etc/kod-release ] && . /etc/kod-release
+
+KOD_NONET=0
+KOD_IFACE=""
+KOD_NOSWAP=0
+SHELL_PIDS=""
+
+log() { echo "[kod] $*"; }
+
+# ---------------------------------------------------------------------
+#  1. API filesystems (idempotent: stage 1 may already have moved them)
+# ---------------------------------------------------------------------
+# kmount TYPE TARGET OPTIONS
+kmount() {
+    mountpoint -q "$2" 2>/dev/null && return 0
+    mkdir -p "$2"
+    mount -t "$1" -o "$3" "$1" "$2"
+}
+
+kmount proc /proc nosuid,noexec,nodev
+kmount sysfs /sys nosuid,noexec,nodev
+kmount devtmpfs /dev mode=0755,nosuid
+kmount devpts /dev/pts nosuid,noexec,gid=5,mode=0620,ptmxmode=0666
+kmount tmpfs /dev/shm nosuid,nodev,mode=1777
+kmount tmpfs /run nosuid,nodev,mode=0755
+kmount tmpfs /tmp nosuid,nodev,mode=1777
+if [ -d /sys/firmware/efi/efivars ]; then
+    kmount efivarfs /sys/firmware/efi/efivars nosuid,noexec,nodev
+fi
+
+ln -sfn /proc/self/fd /dev/fd
+ln -sfn /proc/self/fd/0 /dev/stdin
+ln -sfn /proc/self/fd/1 /dev/stdout
+ln -sfn /proc/self/fd/2 /dev/stderr
+
+[ -c /dev/console ] && exec </dev/console >/dev/console 2>&1
+
+for arg in $(cat /proc/cmdline); do
+    case "${arg}" in
+        kod.nonet) KOD_NONET=1 ;;
+        kod.iface=*) KOD_IFACE="${arg#kod.iface=}" ;;
+        kod.noswap) KOD_NOSWAP=1 ;;
+        kod.debug) set -x ;;
+    esac
+done
+
+mkdir -p /run/kod /var/log /root
+[ -s /etc/hostname ] && hostname -F /etc/hostname
+ip link set dev lo up 2>/dev/null
+# Keep kernel chatter (except errors) away from the interactive consoles.
+dmesg -n 3 2>/dev/null
+
+# ---------------------------------------------------------------------
+#  2. Console: UTF-8, Cyrillic font, EN/RU keymap
+# ---------------------------------------------------------------------
+if [ -x /usr/local/bin/vakuum-console ]; then
+    /usr/local/bin/vakuum-console init || log "console setup failed"
+else
+    for vt in /dev/tty1 /dev/tty2 /dev/tty3 /dev/tty4 /dev/tty5 /dev/tty6; do
+        [ -c "${vt}" ] && printf '\033%%G' >"${vt}"
+    done
+fi
+
+# ---------------------------------------------------------------------
+#  3. Network: first wired interface (eth*/en*) via DHCP
+# ---------------------------------------------------------------------
+# list_wired_ifaces — candidate interfaces, eth*/en* first.
+list_wired_ifaces() {
+    local p name
+    for p in /sys/class/net/eth* /sys/class/net/en*; do
+        [ -e "${p}" ] || continue
+        echo "${p##*/}"
+    done
+    for p in /sys/class/net/*; do
+        name="${p##*/}"
+        case "${name}" in
+            lo|eth*|en*|wl*|sit*|tun*|tap*|veth*|docker*|br-*) continue ;;
+        esac
+        # Only real devices (skip virtual interfaces).
+        [ -e "${p}/device" ] && echo "${name}"
+    done
+}
+
+# wait_carrier IFACE SECONDS
+wait_carrier() {
+    local i=0
+    while [ "${i}" -lt "$(($2 * 4))" ]; do
+        [ "$(cat "/sys/class/net/$1/carrier" 2>/dev/null)" = "1" ] && return 0
+        sleep 0.25
+        i=$((i + 1))
+    done
+    return 1
+}
+
+start_dhcp() {
+    local iface="$1" mode="$2"
+    local args="-i ${iface} -s /etc/udhcpc.script -p /run/udhcpc.${iface}.pid"
+    args="${args} -x hostname:$(hostname)"
+    if [ "${mode}" = fg ]; then
+        # Up to ~10 s in the foreground, then udhcpc keeps trying as a daemon.
+        # shellcheck disable=SC2086
+        udhcpc ${args} -t 5 -T 2 -A 5 -b >/run/kod/udhcpc.log 2>&1
+    else
+        # shellcheck disable=SC2086
+        udhcpc ${args} -t 3 -T 3 -A 10 -b >/run/kod/udhcpc.log 2>&1 &
+    fi
+}
+
+setup_network() {
+    local iface candidates="" waited=0
+    if [ -n "${KOD_IFACE}" ]; then
+        candidates="${KOD_IFACE}"
+    else
+        # Built-in drivers have usually probed already; allow ~5 s anyway.
+        while [ -z "${candidates}" ] && [ "${waited}" -lt 20 ]; do
+            candidates="$(list_wired_ifaces)"
+            [ -n "${candidates}" ] && break
+            sleep 0.25
+            waited=$((waited + 1))
+        done
+    fi
+    if [ -z "${candidates}" ]; then
+        log "network: no wired interface found"
+        return 1
+    fi
+    for iface in ${candidates}; do
+        ip link set dev "${iface}" up 2>/dev/null || continue
+    done
+    for iface in ${candidates}; do
+        if wait_carrier "${iface}" 5; then
+            log "network: ${iface} has link, requesting a DHCP lease..."
+            start_dhcp "${iface}" fg
+            KOD_NET_IFACE="${iface}"
+            return 0
+        fi
+    done
+    # No carrier yet (cable unplugged?) — keep trying in the background.
+    # shellcheck disable=SC2086  # split the interface list
+    set -- ${candidates}
+    log "network: no link on ${candidates}; DHCP continues in background on $1"
+    start_dhcp "$1" bg
+    KOD_NET_IFACE="$1"
+    return 0
+}
+
+KOD_NET_IFACE=""
+if [ "${KOD_NONET}" = 0 ]; then
+    setup_network
+else
+    log "network: disabled (kod.nonet)"
+fi
+
+# ---------------------------------------------------------------------
+#  4. Swap: zram when RAM < 4 GiB, disk swap file if a target is ready
+# ---------------------------------------------------------------------
+if [ "${KOD_NOSWAP}" = 0 ] && [ -x /usr/local/bin/vakuum-prep-swap ]; then
+    /usr/local/bin/vakuum-prep-swap --boot || log "swap: preparation failed"
+fi
+
+# ---------------------------------------------------------------------
+#  5. Banner
+# ---------------------------------------------------------------------
+kod_banner() {
+    local mem_kb mem_mb swap_kb addr gw dns
+    mem_kb="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+    swap_kb="$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)"
+    mem_mb=$((mem_kb / 1024))
+    echo
+    echo "  Welcome to Vakuum OS Builder (kod-mini v${KOD_VERSION} | musl + LLVM)"
+    echo
+    echo "  Kernel  : Linux $(uname -r) $(uname -m)"
+    echo "  Memory  : ${mem_mb} MiB RAM, $((swap_kb / 1024)) MiB swap"
+    if [ -n "${KOD_NET_IFACE}" ]; then
+        addr="$(ip -4 -o addr show dev "${KOD_NET_IFACE}" 2>/dev/null |
+            awk '{ print $4; exit }')"
+        gw="$(ip -4 route show default 2>/dev/null | awk '{ print $3; exit }')"
+        dns="$(awk '/^nameserver/ { printf "%s ", $2 }' /etc/resolv.conf 2>/dev/null)"
+        echo "  Network : ${KOD_NET_IFACE} ${addr:-(waiting for DHCP)}${gw:+ via ${gw}}"
+        [ -n "${dns}" ] && echo "  DNS     : ${dns}"
+    else
+        echo "  Network : offline"
+    fi
+    echo "  Rootfs  : ${KOD_ROOTFS_SOURCE:-fallback-rootfs}"
+    echo
+    echo "  Disks   : lsblk, fdisk -l, sfdisk, wipefs, mkfs.ext4, mkfs.fat"
+    echo "  Swap    : vakuum-prep-swap <target>   Help: kod_help"
+    echo "  Keyboard: Ctrl+Shift toggles EN/RU ('vakuum-console ru|us')"
+    echo "  Power   : poweroff | reboot"
+    echo
+}
+
+kod_banner >/run/kod/banner 2>/dev/null
+cat /run/kod/banner
+
+# ---------------------------------------------------------------------
+#  6. Interactive shells with job control: setsid + cttyhack
+# ---------------------------------------------------------------------
+# serial_present TTY — the UART really exists (8250 type 0 = no device).
+serial_present() {
+    local t
+    [ -c "/dev/$1" ] || return 1
+    t="$(cat "/sys/class/tty/$1/type" 2>/dev/null)" || return 1
+    [ -n "${t}" ] && [ "${t}" != 0 ]
+}
+
+# spawn_shell TTY TERM — start the respawn loop ("/init --respawn-shell")
+# through start-stop-daemon: asynchronous '&' jobs of a non-interactive
+# shell ignore SIGINT forever, which would break Ctrl+C in bash.
+spawn_shell() {
+    start-stop-daemon -S -b -m -p "/run/kod/shell-$1.pid" \
+        -x /init -- --respawn-shell "$1" "$2"
+    SHELL_PIDS="${SHELL_PIDS} /run/kod/shell-$1.pid"
+}
+
+kod_shutdown() {
+    trap '' INT TERM USR1 USR2
+    echo
+    log "The system is going down: $1"
+    for pidfile in ${SHELL_PIDS}; do
+        [ -f "${pidfile}" ] && kill -TERM "$(cat "${pidfile}")" 2>/dev/null
+    done
+    kill -TERM -1 2>/dev/null
+    sleep 2
+    kill -KILL -1 2>/dev/null
+    [ -x /usr/local/bin/vakuum-prep-swap ] && /usr/local/bin/vakuum-prep-swap --off
+    swapoff -a 2>/dev/null
+    sync
+    umount -a -r 2>/dev/null
+    sync
+    case "$1" in
+        reboot) reboot -f ;;
+        halt) halt -f ;;
+        *) poweroff -f ;;
+    esac
+    # Not reached; never let PID 1 exit.
+    while :; do sleep 60; done
+}
+
+# BusyBox halt/poweroff/reboot signal PID 1: USR1/USR2/TERM.
+# The kernel sends SIGINT on Ctrl+Alt+Del.
+trap 'kod_shutdown halt' USR1
+trap 'kod_shutdown poweroff' USR2
+trap 'kod_shutdown reboot' TERM INT
+
+spawn_shell tty1 linux
+if serial_present "${KOD_SERIAL_TTY:-ttyS0}"; then
+    spawn_shell "${KOD_SERIAL_TTY:-ttyS0}" vt102
+fi
+
+# ---------------------------------------------------------------------
+#  PID 1 main loop. ash waits with waitpid(-1), so orphans re-parented
+#  to PID 1 are reaped while 'wait'/'sleep' run; trapped signals
+#  (poweroff/reboot) are handled between iterations.
+# ---------------------------------------------------------------------
+while :; do
+    wait
+    sleep 1
+done

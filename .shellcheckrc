@@ -1,0 +1,7 @@
+# ShellCheck settings for kod-mini-build
+# - SC1091: target-only files (/etc/kod/*.conf, /etc/kod-release) are
+#           sourced at runtime and do not exist on the build host.
+# - SC2013: word-splitting /proc/cmdline is intentional.
+external-sources=true
+source-path=SCRIPTDIR
+disable=SC1091,SC2013

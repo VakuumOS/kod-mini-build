@@ -1,0 +1,7 @@
+NAME="Vakuum OS Builder"
+PRETTY_NAME="Vakuum OS Builder (kod-mini)"
+ID=kod-mini
+ID_LIKE=vakuum
+VERSION_ID=0.1
+HOME_URL="https://github.com/VakuumOS"
+BUG_REPORT_URL="https://github.com/VakuumOS/kod-mini-build/issues"

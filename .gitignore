@@ -1,0 +1,18 @@
+# --- Build trees (never commit) ---
+/sources/
+/work/
+/out/
+
+# --- Build artifacts ---
+*.iso
+*.tar.*
+*.sfs
+*.img
+*.cpio
+*.cpio.*
+
+# --- Local caches / editors ---
+/.ccache/
+*.swp
+*~
+.DS_Store

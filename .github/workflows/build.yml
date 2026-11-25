@@ -1,0 +1,118 @@
+# Vakuum OS Builder (kod-mini) — CI image build
+#
+# Fetches all sources (cached), builds the musl/LLVM toolchain, kernel,
+# userspace and the hybrid BIOS+UEFI Limine ISO, then publishes it as a
+# workflow artifact.
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      clean_sources:
+        description: "Ignore the sources/ cache and download everything again"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: x86_64
+  KOD_COLOR: "1"
+
+jobs:
+  iso:
+    name: ISO (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            clang lld llvm libclang-rt-18-dev musl-tools \
+            xorriso mtools bc bison flex libelf-dev libssl-dev \
+            cpio zstd squashfs-tools curl xz-utils bzip2 \
+            kbd make perl python3 git ca-certificates
+          clang --version | head -n1
+          ld.lld --version
+          mksquashfs -version | head -n1
+          xorriso -version 2>&1 | head -n1
+
+      - name: Resolve source versions
+        id: versions
+        run: |
+          scripts/fetch.sh --resolve | tee resolved-versions.txt
+          echo "key=$(sha256sum resolved-versions.txt configs/versions.conf \
+            | sha256sum | cut -c1-16)" >>"$GITHUB_OUTPUT"
+
+      - name: Cache sources
+        if: ${{ !inputs.clean_sources }}
+        uses: actions/cache@v4
+        with:
+          path: sources
+          key: kod-sources-${{ steps.versions.outputs.key }}
+          restore-keys: |
+            kod-sources-
+
+      - name: Fetch sources
+        run: scripts/fetch.sh --prune
+
+      - name: Build ISO
+        run: scripts/build.sh --arch "${ARCH}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Vakuum OS Builder — ${ARCH}"
+            echo
+            if [ -f "out/vakuum-builder-${ARCH}.iso" ]; then
+              echo "| file | size | sha256 |"
+              echo "|---|---|---|"
+              echo "| vakuum-builder-${ARCH}.iso" \
+                "| $(du -h "out/vakuum-builder-${ARCH}.iso" | cut -f1)" \
+                "| \`$(cut -d' ' -f1 "out/vakuum-builder-${ARCH}.iso.sha256")\` |"
+            else
+              echo "Build failed — see the logs artifact."
+            fi
+            echo
+            echo '```'
+            cat resolved-versions.txt 2>/dev/null || true
+            grep -E '^(ROOTFS_SOURCE|ROOTFS_COMMIT|LIMINE_COMMIT|TERMINUS_AVAILABLE)=' \
+              work/versions.env 2>/dev/null || true
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: vakuum-builder-${{ env.ARCH }}-${{ github.sha }}
+          path: |
+            out/vakuum-builder-${{ env.ARCH }}.iso
+            out/vakuum-builder-${{ env.ARCH }}.iso.sha256
+            out/kernel-${{ env.ARCH }}.config
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ env.ARCH }}-${{ github.sha }}
+          path: work/${{ env.ARCH }}/logs
+          if-no-files-found: ignore
+          retention-days: 7
